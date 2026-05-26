@@ -15,6 +15,7 @@
 //  parsing logic, kept pure so it can be unit tested without any UI or network.
 //
 
+import Combine
 import Foundation
 
 // MARK: - Plan Model
