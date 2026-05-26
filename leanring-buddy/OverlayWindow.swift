@@ -935,6 +935,12 @@ class OverlayWindowManager {
     private var overlayWindows: [OverlayWindow] = []
     var hasShownOverlayBefore = false
 
+    /// Observes Space changes so the overlay re-asserts itself when another app
+    /// (FaceTime, Keynote, a fullscreen browser, etc.) enters fullscreen and
+    /// macOS moves it to its own Space. Without re-ordering front on that
+    /// transition, the cursor and Coach HUD can drop out of the new Space.
+    private var activeSpaceChangeObserver: NSObjectProtocol?
+
     func showOverlay(onScreens screens: [NSScreen], companionManager: CompanionManager) {
         // Hide any existing overlays
         hideOverlay()
@@ -960,9 +966,42 @@ class OverlayWindowManager {
             overlayWindows.append(window)
             window.orderFrontRegardless()
         }
+
+        startObservingActiveSpaceChanges()
+    }
+
+    /// Re-orders every overlay window to the front. Called on Space changes so
+    /// the overlay reliably appears over fullscreen apps in their own Spaces.
+    func reassertOverlayInFront() {
+        for window in overlayWindows {
+            window.orderFrontRegardless()
+        }
+    }
+
+    private func startObservingActiveSpaceChanges() {
+        guard activeSpaceChangeObserver == nil else { return }
+        activeSpaceChangeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            // The notification is delivered on the main queue, so hop to the
+            // main actor to touch the windows.
+            Task { @MainActor [weak self] in
+                self?.reassertOverlayInFront()
+            }
+        }
+    }
+
+    private func stopObservingActiveSpaceChanges() {
+        if let observer = activeSpaceChangeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            activeSpaceChangeObserver = nil
+        }
     }
 
     func hideOverlay() {
+        stopObservingActiveSpaceChanges()
         for window in overlayWindows {
             window.orderOut(nil)
             window.contentView = nil
@@ -972,6 +1011,7 @@ class OverlayWindowManager {
 
     /// Fades out overlay windows over `duration` seconds, then removes them.
     func fadeOutAndHideOverlay(duration: TimeInterval = 0.4) {
+        stopObservingActiveSpaceChanges()
         let windowsToFade = overlayWindows
         overlayWindows.removeAll()
 
