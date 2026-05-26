@@ -12,7 +12,15 @@ import SwiftUI
 
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
+    /// Observed directly so the "coaching in progress" control appears, updates,
+    /// and disappears live as a guided walkthrough runs.
+    @ObservedObject var guidedWalkthroughManager: GuidedWalkthroughManager
     @State private var emailInput: String = ""
+
+    init(companionManager: CompanionManager) {
+        _companionManager = ObservedObject(wrappedValue: companionManager)
+        _guidedWalkthroughManager = ObservedObject(wrappedValue: companionManager.guidedWalkthroughManager)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -25,11 +33,25 @@ struct CompanionPanelView: View {
                 .padding(.top, 16)
                 .padding(.horizontal, 16)
 
+            if guidedWalkthroughManager.isActive {
+                Spacer()
+                    .frame(height: 12)
+
+                walkthroughStatusSection
+                    .padding(.horizontal, 16)
+            }
+
             if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
                 Spacer()
                     .frame(height: 12)
 
                 modelPickerRow
+                    .padding(.horizontal, 16)
+
+                Spacer()
+                    .frame(height: 12)
+
+                cursorAppearanceSection
                     .padding(.horizontal, 16)
             }
 
@@ -639,6 +661,142 @@ struct CompanionPanelView: View {
         }
         .buttonStyle(.plain)
         .pointerCursor()
+    }
+
+    // MARK: - Clicky Coach Status
+
+    /// Shown while a guided walkthrough is running so the user can see progress
+    /// and stop it from the menu (the on-screen HUD is non-interactive).
+    private var walkthroughStatusSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(companionManager.cursorPrimaryColor)
+                Text("Coaching in progress")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(DS.Colors.textPrimary)
+                Spacer()
+                Text("Step \(guidedWalkthroughManager.currentStepIndex + 1) of \(guidedWalkthroughManager.totalStepCount)")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+
+            if let step = guidedWalkthroughManager.currentStep {
+                Text(step.instruction)
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Button(action: {
+                companionManager.cancelGuidedWalkthrough(reason: "user_stopped")
+            }) {
+                HStack(spacing: 6) {
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text("Stop walkthrough")
+                        .font(.system(size: 12, weight: .medium))
+                }
+            }
+            .dsDestructiveButtonStyle()
+            .padding(.top, 2)
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .fill(companionManager.cursorPrimaryColor.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .stroke(companionManager.cursorPrimaryColor.opacity(0.30), lineWidth: 0.8)
+        )
+    }
+
+    // MARK: - Cursor Appearance
+
+    /// Lets the user pick the cursor's shape (style) and color (theme).
+    /// Both choices persist and update the live overlay immediately.
+    private var cursorAppearanceSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Cursor")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Spacer()
+                Text(companionManager.selectedCursorStyle.displayName)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+
+            // Style chips — one per cursor shape.
+            HStack(spacing: 6) {
+                ForEach(ClickyCursorStyle.allCases) { style in
+                    cursorStyleChip(style: style)
+                }
+            }
+
+            // Color swatches — themed accent for the cursor and its glow.
+            HStack(spacing: 8) {
+                ForEach(ClickyCursorTheme.allCases) { theme in
+                    cursorThemeSwatch(theme: theme)
+                }
+                Spacer()
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func cursorStyleChip(style: ClickyCursorStyle) -> some View {
+        let isSelected = companionManager.selectedCursorStyle == style
+        return Button(action: {
+            companionManager.setCursorStyle(style)
+        }) {
+            VStack(spacing: 4) {
+                Image(systemName: style.pickerSymbolName)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(isSelected ? companionManager.cursorPrimaryColor : DS.Colors.textTertiary)
+                Text(style.displayName)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(isSelected ? Color.white.opacity(0.10) : Color.white.opacity(0.04))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .stroke(isSelected ? companionManager.cursorPrimaryColor.opacity(0.6) : DS.Colors.borderSubtle, lineWidth: isSelected ? 1 : 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+    }
+
+    private func cursorThemeSwatch(theme: ClickyCursorTheme) -> some View {
+        let isSelected = companionManager.selectedCursorTheme == theme
+        return Button(action: {
+            companionManager.setCursorTheme(theme)
+        }) {
+            Circle()
+                .fill(theme.primaryColor)
+                .frame(width: 18, height: 18)
+                .overlay(
+                    Circle()
+                        .stroke(Color.white.opacity(isSelected ? 0.9 : 0.0), lineWidth: 2)
+                        .padding(1)
+                )
+                .overlay(
+                    Circle()
+                        .stroke(Color.black.opacity(0.25), lineWidth: 0.5)
+                )
+                .shadow(color: isSelected ? theme.glowColor.opacity(0.7) : Color.clear, radius: 5)
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+        .nativeTooltip(theme.displayName)
     }
 
     // MARK: - DM Farza Button

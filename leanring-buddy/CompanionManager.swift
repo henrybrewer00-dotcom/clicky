@@ -65,12 +65,22 @@ final class CompanionManager: ObservableObject {
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
+
+    /// "Clicky Coach" — drives multi-step guided walkthroughs. Holds the plan
+    /// and progress state observed by the HUD and panel; the orchestration loop
+    /// that captures screenshots and calls Claude lives in this manager below.
+    let guidedWalkthroughManager = GuidedWalkthroughManager()
+
+    /// The running guided-walkthrough orchestration task, if any. Cancelled when
+    /// the user speaks again or the walkthrough completes.
+    private var currentWalkthroughTask: Task<Void, Never>?
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
     /// Base URL for the Cloudflare Worker proxy. All API requests route
-    /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
+    /// through this so keys never ship in the app binary. Configured once in
+    /// Info.plist (`ClickyProxyBaseURL`) and read via AppBundleConfiguration.
+    private static let workerBaseURL = AppBundleConfiguration.proxyBaseURL
 
     private lazy var claudeAPI: ClaudeAPI = {
         return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
@@ -115,6 +125,36 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
         claudeAPI.model = model
     }
+
+    // MARK: - Cursor Appearance
+
+    /// The visual style of the companion cursor (triangle, comet, rocket, sparkle).
+    /// Persisted to UserDefaults so the choice survives restarts.
+    @Published var selectedCursorStyle: ClickyCursorStyle =
+        ClickyCursorStyle.from(rawValue: UserDefaults.standard.string(forKey: "selectedCursorStyle"))
+
+    /// The color theme applied to the cursor glyph, glow, waveform, spinner,
+    /// and speech bubbles. Persisted to UserDefaults.
+    @Published var selectedCursorTheme: ClickyCursorTheme =
+        ClickyCursorTheme.from(rawValue: UserDefaults.standard.string(forKey: "selectedCursorTheme"))
+
+    func setCursorStyle(_ style: ClickyCursorStyle) {
+        selectedCursorStyle = style
+        UserDefaults.standard.set(style.rawValue, forKey: "selectedCursorStyle")
+        ClickyAnalytics.trackCursorStyleChanged(style: style.rawValue)
+    }
+
+    func setCursorTheme(_ theme: ClickyCursorTheme) {
+        selectedCursorTheme = theme
+        UserDefaults.standard.set(theme.rawValue, forKey: "selectedCursorTheme")
+        ClickyAnalytics.trackCursorThemeChanged(theme: theme.rawValue)
+    }
+
+    /// The main fill color for the cursor glyph and themed accents.
+    var cursorPrimaryColor: Color { selectedCursorTheme.primaryColor }
+
+    /// The glow/bloom color used in the cursor's shadow and bubble highlights.
+    var cursorGlowColor: Color { selectedCursorTheme.glowColor }
 
     /// User preference for whether the Clicky cursor should be shown.
     /// When toggled off, the overlay is hidden and push-to-talk is disabled.
@@ -295,6 +335,8 @@ final class CompanionManager: ObservableObject {
 
         currentResponseTask?.cancel()
         currentResponseTask = nil
+        currentWalkthroughTask?.cancel()
+        currentWalkthroughTask = nil
         shortcutTransitionCancellable?.cancel()
         voiceStateCancellable?.cancel()
         audioPowerCancellable?.cancel()
@@ -491,8 +533,10 @@ final class CompanionManager: ObservableObject {
             // Dismiss the menu bar panel so it doesn't cover the screen
             NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
 
-            // Cancel any in-progress response and TTS from a previous utterance
+            // Cancel any in-progress response and TTS from a previous utterance,
+            // including an active guided walkthrough — the user wants to talk now.
             currentResponseTask?.cancel()
+            cancelGuidedWalkthrough(reason: "user_spoke")
             elevenLabsTTSClient.stopPlayback()
             clearDetectedElementLocation()
 
@@ -574,7 +618,7 @@ final class CompanionManager: ObservableObject {
     - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. curious how it connects to the css you're looking at? [POINT:none]"
     - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:285,11:source control]"
     - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
-    """
+    """ + GuidedWalkthroughManager.planInstruction
 
     // MARK: - AI Response Pipeline
 
@@ -622,8 +666,26 @@ final class CompanionManager: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
-                // Parse the [POINT:...] tag from Claude's response
-                let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
+                // First, check whether Claude returned a multi-step guided
+                // walkthrough plan. If so, hand off to Clicky Coach instead of
+                // the single-point flow — the coach will point at each step and
+                // watch the screen to advance automatically.
+                let walkthroughParse = GuidedWalkthroughManager.parseWalkthroughPlan(from: fullResponseText)
+                if let walkthroughPlan = walkthroughParse.plan, walkthroughPlan.steps.count >= 2 {
+                    conversationHistory.append((
+                        userTranscript: transcript,
+                        assistantResponse: walkthroughParse.remainingText
+                    ))
+                    if conversationHistory.count > 10 {
+                        conversationHistory.removeFirst(conversationHistory.count - 10)
+                    }
+                    startGuidedWalkthrough(plan: walkthroughPlan, introText: walkthroughParse.remainingText)
+                    return
+                }
+
+                // Parse the [POINT:...] tag from Claude's response (using the
+                // text with any walkthrough block already stripped out).
+                let parseResult = Self.parsePointingCoordinates(from: walkthroughParse.remainingText)
                 let spokenText = parseResult.spokenText
 
                 // Handle element pointing if Claude returned coordinates.
@@ -730,6 +792,8 @@ final class CompanionManager: ObservableObject {
     /// fades out the overlay after a 1-second pause. Cancelled automatically
     /// if the user starts another push-to-talk interaction.
     private func scheduleTransientHideIfNeeded() {
+        // Never hide the overlay out from under an active guided walkthrough.
+        guard !guidedWalkthroughManager.isActive else { return }
         guard !isClickyCursorEnabled && isOverlayVisible else { return }
 
         transientHideTask?.cancel()
@@ -763,6 +827,246 @@ final class CompanionManager: ObservableObject {
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)
         voiceState = .responding
+    }
+
+    // MARK: - Guided Walkthrough Orchestration (Clicky Coach)
+
+    /// Total number of "is this step done?" screen checks we'll make across an
+    /// entire walkthrough before gracefully handing control back to the user.
+    /// Bounds token spend so a stuck walkthrough can't poll Claude forever.
+    private static let walkthroughTotalWatchCallBudget = 40
+
+    /// How long to wait between screen checks while watching a step (4 seconds).
+    private static let walkthroughPollIntervalNanoseconds: UInt64 = 4_000_000_000
+
+    /// Maximum screen checks for one step before Clicky re-points as a nudge.
+    private static let walkthroughMaxPollsBeforeNudge = 6
+
+    /// Begins a guided walkthrough: speaks the short intro, then steps through
+    /// the plan, pointing at each step and watching the screen to advance.
+    func startGuidedWalkthrough(plan: WalkthroughPlan, introText: String) {
+        currentResponseTask?.cancel()
+        currentWalkthroughTask?.cancel()
+        transientHideTask?.cancel()
+        transientHideTask = nil
+        elevenLabsTTSClient.stopPlayback()
+        clearDetectedElementLocation()
+
+        guidedWalkthroughManager.begin(plan: plan)
+        ClickyAnalytics.trackWalkthroughStarted(stepCount: plan.steps.count)
+        voiceState = .idle
+
+        currentWalkthroughTask = Task { [weak self] in
+            await self?.runGuidedWalkthrough(introText: introText)
+        }
+    }
+
+    /// Cancels an in-progress walkthrough (e.g. the user spoke again, or hit Stop).
+    func cancelGuidedWalkthrough(reason: String) {
+        guard guidedWalkthroughManager.isActive else { return }
+        currentWalkthroughTask?.cancel()
+        currentWalkthroughTask = nil
+        guidedWalkthroughManager.cancel()
+        clearDetectedElementLocation()
+        ClickyAnalytics.trackWalkthroughCancelled(reason: reason)
+    }
+
+    /// The main walkthrough loop. For each step: locate + point at the element,
+    /// speak the instruction once, then watch the screen until the step is done
+    /// (or we exhaust the watch budget). Re-points as a silent nudge if the user
+    /// is taking a while. Fully cancellable.
+    private func runGuidedWalkthrough(introText: String) async {
+        let trimmedIntro = introText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedIntro.isEmpty {
+            voiceState = .responding
+            try? await speakWalkthrough(trimmedIntro)
+            voiceState = .idle
+        }
+
+        var watchCallsRemaining = Self.walkthroughTotalWatchCallBudget
+        var lastSpokenStepNumber = -1
+
+        while guidedWalkthroughManager.isActive {
+            guard let step = guidedWalkthroughManager.currentStep else { break }
+            if Task.isCancelled { return }
+
+            // 1) Locate the element on the current screen and fly the cursor to it.
+            guidedWalkthroughManager.setPhase(.locating)
+            await pointAtWalkthroughStep(step)
+            if Task.isCancelled { return }
+
+            // Speak the instruction only the first time we enter this step —
+            // re-entries (nudges) just re-point without repeating the words.
+            if lastSpokenStepNumber != step.stepNumber {
+                lastSpokenStepNumber = step.stepNumber
+                voiceState = .responding
+                try? await speakWalkthrough("step \(step.stepNumber). \(step.instruction)")
+                voiceState = .idle
+            }
+
+            // 2) Watch the screen until the step is done or polls run out.
+            guidedWalkthroughManager.setPhase(.watching)
+            var stepCompleted = false
+            var pollsForThisStep = 0
+            while !stepCompleted
+                    && pollsForThisStep < Self.walkthroughMaxPollsBeforeNudge
+                    && watchCallsRemaining > 0 {
+                try? await Task.sleep(nanoseconds: Self.walkthroughPollIntervalNanoseconds)
+                if Task.isCancelled { return }
+                pollsForThisStep += 1
+                watchCallsRemaining -= 1
+                stepCompleted = await checkWalkthroughStepCompleted(step)
+                if Task.isCancelled { return }
+            }
+
+            if stepCompleted {
+                // 3) Advance to the next step, or finish if that was the last.
+                guidedWalkthroughManager.setPhase(.advancing)
+                let hasNextStep = guidedWalkthroughManager.advanceToNextStep()
+                if hasNextStep {
+                    ClickyAnalytics.trackWalkthroughStepAdvanced(
+                        stepIndex: guidedWalkthroughManager.currentStepIndex,
+                        stepCount: guidedWalkthroughManager.totalStepCount
+                    )
+                    voiceState = .responding
+                    try? await speakWalkthrough("nice. next up.")
+                    voiceState = .idle
+                } else {
+                    voiceState = .responding
+                    try? await speakWalkthrough("and that's it — nicely done.")
+                    voiceState = .idle
+                    ClickyAnalytics.trackWalkthroughCompleted(stepCount: guidedWalkthroughManager.totalStepCount)
+                    finishWalkthrough(completed: true)
+                    return
+                }
+            } else if watchCallsRemaining <= 0 {
+                voiceState = .responding
+                try? await speakWalkthrough("i'll let you take it from here. you've got this.")
+                voiceState = .idle
+                ClickyAnalytics.trackWalkthroughCancelled(reason: "watch_budget_exhausted")
+                finishWalkthrough(completed: false)
+                return
+            }
+            // Otherwise: step not done but budget remains — the loop repeats and
+            // re-points at the same step as a gentle nudge.
+        }
+    }
+
+    /// Locates the current step's element on a fresh screenshot and points the
+    /// cursor at it, showing the step instruction in the speech bubble.
+    private func pointAtWalkthroughStep(_ step: WalkthroughStep) async {
+        do {
+            let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+            guard let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }) else { return }
+
+            let dimensionInfo = " (image dimensions: \(cursorScreenCapture.screenshotWidthInPixels)x\(cursorScreenCapture.screenshotHeightInPixels) pixels)"
+            let labeledImages = [(data: cursorScreenCapture.imageData, label: cursorScreenCapture.label + dimensionInfo)]
+
+            let (responseText, _) = try await claudeAPI.analyzeImageStreaming(
+                images: labeledImages,
+                systemPrompt: GuidedWalkthroughManager.locatePrompt(
+                    forStep: step,
+                    totalSteps: guidedWalkthroughManager.totalStepCount
+                ),
+                userPrompt: "point at the element for this step on my current screen",
+                onTextChunk: { _ in }
+            )
+
+            guard !Task.isCancelled else { return }
+
+            let parseResult = Self.parsePointingCoordinates(from: responseText)
+            guard let pointCoordinate = parseResult.coordinate else { return }
+
+            let scaled = globalScreenLocation(forPixelCoordinate: pointCoordinate, in: cursorScreenCapture)
+            detectedElementBubbleText = "step \(step.stepNumber): \(step.instruction)"
+            detectedElementScreenLocation = scaled.location
+            detectedElementDisplayFrame = scaled.displayFrame
+        } catch {
+            print("⚠️ Walkthrough locate error: \(error)")
+        }
+    }
+
+    /// Captures the current screen and asks Claude whether the given step is
+    /// complete. Returns false on any error so the walkthrough keeps waiting.
+    private func checkWalkthroughStepCompleted(_ step: WalkthroughStep) async -> Bool {
+        do {
+            let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+            guard let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }) else { return false }
+
+            let dimensionInfo = " (image dimensions: \(cursorScreenCapture.screenshotWidthInPixels)x\(cursorScreenCapture.screenshotHeightInPixels) pixels)"
+            let labeledImages = [(data: cursorScreenCapture.imageData, label: cursorScreenCapture.label + dimensionInfo)]
+
+            let (responseText, _) = try await claudeAPI.analyzeImageStreaming(
+                images: labeledImages,
+                systemPrompt: GuidedWalkthroughManager.watchPrompt(
+                    forStep: step,
+                    totalSteps: guidedWalkthroughManager.totalStepCount
+                ),
+                userPrompt: "is this step done on my current screen?",
+                onTextChunk: { _ in }
+            )
+            return GuidedWalkthroughManager.parseStepIsComplete(from: responseText)
+        } catch {
+            print("⚠️ Walkthrough watch error: \(error)")
+            return false
+        }
+    }
+
+    /// Speaks a short walkthrough line and waits for playback to finish so the
+    /// next spoken line doesn't overlap. TTS errors are logged, not fatal.
+    private func speakWalkthrough(_ text: String) async throws {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        do {
+            try await elevenLabsTTSClient.speakText(trimmed)
+            while elevenLabsTTSClient.isPlaying {
+                try await Task.sleep(nanoseconds: 150_000_000)
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            print("⚠️ Walkthrough TTS error: \(error)")
+        }
+    }
+
+    /// Ends the walkthrough, shows the HUD's done state briefly, then dismisses it.
+    private func finishWalkthrough(completed: Bool) {
+        guidedWalkthroughManager.finish()
+        clearDetectedElementLocation()
+        voiceState = .idle
+        currentWalkthroughTask = nil
+
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: completed ? 3_000_000_000 : 1_500_000_000)
+            guard let self else { return }
+            self.guidedWalkthroughManager.cancel()
+            self.scheduleTransientHideIfNeeded()
+        }
+    }
+
+    /// Converts a pixel coordinate in a screenshot to a global AppKit screen
+    /// location (and returns the display frame), mirroring the scaling used by
+    /// the single-point pipeline. Shared by the walkthrough step pointing.
+    private func globalScreenLocation(
+        forPixelCoordinate coordinate: CGPoint,
+        in capture: CompanionScreenCapture
+    ) -> (location: CGPoint, displayFrame: CGRect) {
+        let screenshotWidth = CGFloat(capture.screenshotWidthInPixels)
+        let screenshotHeight = CGFloat(capture.screenshotHeightInPixels)
+        let displayWidth = CGFloat(capture.displayWidthInPoints)
+        let displayHeight = CGFloat(capture.displayHeightInPoints)
+        let displayFrame = capture.displayFrame
+
+        let clampedX = max(0, min(coordinate.x, screenshotWidth))
+        let clampedY = max(0, min(coordinate.y, screenshotHeight))
+        let displayLocalX = clampedX * (displayWidth / screenshotWidth)
+        let displayLocalY = clampedY * (displayHeight / screenshotHeight)
+        let appKitY = displayHeight - displayLocalY
+        let globalLocation = CGPoint(
+            x: displayLocalX + displayFrame.origin.x,
+            y: appKitY + displayFrame.origin.y
+        )
+        return (globalLocation, displayFrame)
     }
 
     // MARK: - Point Tag Parsing

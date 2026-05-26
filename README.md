@@ -19,6 +19,17 @@ Here's the [original tweet](https://x.com/FarzaTV/status/2041314633978659092) th
 
 This is the open-source version of Clicky for those that want to hack on it, build their own features, or just see how it works under the hood.
 
+## ✨ What's new in this fork
+
+This fork extends the open-source Clicky with a few big additions:
+
+- 🚀 **Clicky Coach — guided walkthroughs (the headline feature).** Ask Clicky how to do a multi-step task ("how do I commit and push", "set up dark mode") and instead of pointing once, it lays out an ordered plan, points at step 1, **watches your screen, and auto-advances** as you complete each step — with a live progress HUD. Hands-free, step-by-step coaching.
+- 🎨 **Stylized cursors.** Pick the cursor's shape — **Classic** triangle, **Comet** (with a fading particle trail during flight), **Rocket**, or **Sparkle** — and a **color theme** (Blue, Violet, Emerald, Sunset, Rose, Mono). Themes recolor the cursor, glow, waveform, spinner, and speech bubbles. Choices persist; default is unchanged.
+- 🛠 **Hardened, tested Worker.** CORS + preflight, input validation, a 16 MB body limit, a consistent error envelope, a `/health` probe, a streaming `/tts/stream` endpoint, a `/voices` listing, and per-request `voice_id`/`model_id` overrides. Backed by an automated test suite (`npm test`) that boots `wrangler dev` and checks every route, plus a live ElevenLabs TTS check.
+- ⚙️ **One-place config.** The Worker URL is read from a single `ClickyProxyBaseURL` Info.plist key instead of being hardcoded across files.
+
+See the per-feature details in `CLAUDE.md`. The cursor and Coach controls live in the menu-bar panel.
+
 ## Get started with Claude Code
 
 The fastest way to get this running is with [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
@@ -99,19 +110,31 @@ ELEVENLABS_API_KEY=...
 ELEVENLABS_VOICE_ID=...
 ```
 
-Then update the proxy URLs in the Swift code to point to `http://localhost:8787` instead of the deployed Worker URL while developing. Grep for `clicky-proxy` to find them all.
+Then point the app at `http://localhost:8787` (see step 3) while developing.
 
-### 3. Update the proxy URLs in the app
-
-The app has the Worker URL hardcoded in a few places. Search for `your-worker-name.your-subdomain.workers.dev` and replace it with your Worker URL:
+You can also verify the Worker without the app:
 
 ```bash
-grep -r "clicky-proxy" leanring-buddy/
+cd worker
+npm install
+npm run typecheck   # type-checks src/index.ts
+npm test            # boots wrangler dev and exercises every route over HTTP
+npm run test:live   # also runs one real ElevenLabs TTS call (uses credits)
 ```
 
-You'll find it in:
-- `CompanionManager.swift` — Claude chat + ElevenLabs TTS
-- `AssemblyAIStreamingTranscriptionProvider.swift` — AssemblyAI token endpoint
+### 3. Point the app at your Worker
+
+The Worker URL lives in **one place** now: the `ClickyProxyBaseURL` key in
+`leanring-buddy/Info.plist`. Set it to your Worker URL (no trailing path):
+
+```xml
+<key>ClickyProxyBaseURL</key>
+<string>https://your-worker-name.your-subdomain.workers.dev</string>
+```
+
+`AppBundleConfiguration.proxyBaseURL` reads this and both `CompanionManager`
+(Claude + ElevenLabs) and `AssemblyAIStreamingTranscriptionProvider` (token
+endpoint) derive their URLs from it — so there's nothing else to edit.
 
 ### 4. Open in Xcode and run
 
@@ -150,8 +173,11 @@ leanring-buddy/          # Swift source (yes, the typo stays)
   OverlayWindow.swift       # Blue cursor overlay
   AssemblyAI*.swift         # Real-time transcription
   BuddyDictation*.swift     # Push-to-talk pipeline
+  CursorStyle.swift         # Cursor styles + color themes + glyph view
+  GuidedWalkthroughManager.swift  # Clicky Coach: walkthrough plan + parsers
 worker/                  # Cloudflare Worker proxy
-  src/index.ts              # Three routes: /chat, /tts, /transcribe-token
+  src/index.ts              # Routes: /health, /chat, /tts, /tts/stream, /voices, /transcribe-token
+  test/worker.test.mjs      # Integration test suite (npm test)
 CLAUDE.md                # Full architecture doc (agents read this)
 ```
 

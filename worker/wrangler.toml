@@ -3,4 +3,6 @@ main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
 [vars]
-ELEVENLABS_VOICE_ID = "kPzsL2i3teMYv0FxEYQ6"
+# Default ElevenLabs voice — "Will - Relaxed Optimist" (warm, friendly, fits Clicky).
+# Override per request via the "voice_id" body field, or change this default.
+ELEVENLABS_VOICE_ID = "bIHbv24MWmeRgasZH58o"

@@ -118,4 +118,51 @@ enum ClickyAnalytics {
             "error": error
         ])
     }
+
+    // MARK: - Cursor Appearance
+
+    /// User picked a different cursor style (classic, comet, rocket, sparkle).
+    static func trackCursorStyleChanged(style: String) {
+        PostHogSDK.shared.capture("cursor_style_changed", properties: [
+            "style": style
+        ])
+    }
+
+    /// User picked a different cursor color theme.
+    static func trackCursorThemeChanged(theme: String) {
+        PostHogSDK.shared.capture("cursor_theme_changed", properties: [
+            "theme": theme
+        ])
+    }
+
+    // MARK: - Clicky Coach (Guided Walkthroughs)
+
+    /// A multi-step guided walkthrough began, with the number of planned steps.
+    static func trackWalkthroughStarted(stepCount: Int) {
+        PostHogSDK.shared.capture("walkthrough_started", properties: [
+            "step_count": stepCount
+        ])
+    }
+
+    /// The user completed a step and the walkthrough advanced to the next one.
+    static func trackWalkthroughStepAdvanced(stepIndex: Int, stepCount: Int) {
+        PostHogSDK.shared.capture("walkthrough_step_advanced", properties: [
+            "step_index": stepIndex,
+            "step_count": stepCount
+        ])
+    }
+
+    /// Every step was completed — the walkthrough finished successfully.
+    static func trackWalkthroughCompleted(stepCount: Int) {
+        PostHogSDK.shared.capture("walkthrough_completed", properties: [
+            "step_count": stepCount
+        ])
+    }
+
+    /// The walkthrough was cancelled before completion (user or timeout).
+    static func trackWalkthroughCancelled(reason: String) {
+        PostHogSDK.shared.capture("walkthrough_cancelled", properties: [
+            "reason": reason
+        ])
+    }
 }
