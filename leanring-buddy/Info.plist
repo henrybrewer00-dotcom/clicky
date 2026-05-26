@@ -11,7 +11,7 @@
 	<key>VoiceTranscriptionProvider</key>
 	<string>assemblyai</string>
 	<key>ClickyProxyBaseURL</key>
-	<string>https://your-worker-name.your-subdomain.workers.dev</string>
+	<string>https://clicky-proxy.henrybrewer00.workers.dev</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Clicky uses your microphone so you can talk to it</string>
 	<key>NSScreenCaptureUsageDescription</key>
