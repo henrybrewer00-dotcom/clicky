@@ -162,9 +162,11 @@ final class GuidedWalkthroughManager: ObservableObject {
         return """
         you're clicky, coaching the user through a task one step at a time. you can see their current screen. the user is on step \(step.stepNumber) of \(totalSteps): "\(step.instruction)". the element to point at is the "\(step.targetLabel)".
 
-        find that element on the current screen and point at it. respond with ONLY a coordinate tag, nothing else.
+        find that element on the current screen and point at it. respond with ONLY the tags, nothing else.
 
         format: [POINT:x,y:label] using the screenshot's pixel dimensions as the coordinate space, origin (0,0) at top-left, x rightward, y downward. if you genuinely cannot find the element on this screen, respond [POINT:none].
+
+        if this step is itself a scrolling action (the instruction asks the user to scroll something, like "scroll down the sidebar" or "scroll to the bottom"), ALSO append a scroll tag after the point tag so clicky can demonstrate the scroll: [SCROLL:up], [SCROLL:down], [SCROLL:left], or [SCROLL:right]. only include a scroll tag when the step is actually about scrolling — never otherwise.
         """
     }
 

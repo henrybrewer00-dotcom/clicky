@@ -331,6 +331,7 @@ final class CompanionManager: ObservableObject {
         globalPushToTalkShortcutMonitor.stop()
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()
+        stopWalkthroughClickMonitor()
         transientHideTask?.cancel()
 
         currentResponseTask?.cancel()
@@ -834,13 +835,23 @@ final class CompanionManager: ObservableObject {
     /// Total number of "is this step done?" screen checks we'll make across an
     /// entire walkthrough before gracefully handing control back to the user.
     /// Bounds token spend so a stuck walkthrough can't poll Claude forever.
-    private static let walkthroughTotalWatchCallBudget = 40
+    private static let walkthroughTotalWatchCallBudget = 50
 
-    /// How long to wait between screen checks while watching a step (4 seconds).
-    private static let walkthroughPollIntervalNanoseconds: UInt64 = 4_000_000_000
+    /// Maximum time to wait between screen checks while watching a step. Kept
+    /// short so advancement feels snappy; a click wakes the wait even sooner.
+    private static let walkthroughPollIntervalNanoseconds: UInt64 = 1_600_000_000
 
     /// Maximum screen checks for one step before Clicky re-points as a nudge.
-    private static let walkthroughMaxPollsBeforeNudge = 6
+    private static let walkthroughMaxPollsBeforeNudge = 8
+
+    /// Set true (by the click monitor) to make the watch loop check immediately
+    /// instead of waiting out the poll interval — so Clicky reacts the moment
+    /// the user clicks rather than on a fixed timer.
+    private var walkthroughClickRequestedCheck = false
+
+    /// Global mouse monitor active only during a walkthrough's watching phase.
+    private var walkthroughMouseMonitor: Any?
+    private var pendingClickCheckWorkItem: DispatchWorkItem?
 
     /// Begins a guided walkthrough: speaks the short intro, then steps through
     /// the plan, pointing at each step and watching the screen to advance.
@@ -855,6 +866,7 @@ final class CompanionManager: ObservableObject {
         guidedWalkthroughManager.begin(plan: plan)
         ClickyAnalytics.trackWalkthroughStarted(stepCount: plan.steps.count)
         voiceState = .idle
+        startWalkthroughClickMonitor()
 
         currentWalkthroughTask = Task { [weak self] in
             await self?.runGuidedWalkthrough(introText: introText)
@@ -866,9 +878,68 @@ final class CompanionManager: ObservableObject {
         guard guidedWalkthroughManager.isActive else { return }
         currentWalkthroughTask?.cancel()
         currentWalkthroughTask = nil
+        stopWalkthroughClickMonitor()
         guidedWalkthroughManager.cancel()
         clearDetectedElementLocation()
         ClickyAnalytics.trackWalkthroughCancelled(reason: reason)
+    }
+
+    /// Starts listening for the user's left-clicks so the watch loop can check
+    /// for step completion the instant they click, rather than on a fixed timer.
+    /// A short settle delay lets the UI update before we re-screenshot.
+    private func startWalkthroughClickMonitor() {
+        stopWalkthroughClickMonitor()
+        walkthroughMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.guidedWalkthroughManager.phase == .watching else { return }
+                self.pendingClickCheckWorkItem?.cancel()
+                let settleWorkItem = DispatchWorkItem { [weak self] in
+                    self?.walkthroughClickRequestedCheck = true
+                }
+                self.pendingClickCheckWorkItem = settleWorkItem
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: settleWorkItem)
+            }
+        }
+    }
+
+    private func stopWalkthroughClickMonitor() {
+        if let monitor = walkthroughMouseMonitor {
+            NSEvent.removeMonitor(monitor)
+            walkthroughMouseMonitor = nil
+        }
+        pendingClickCheckWorkItem?.cancel()
+        pendingClickCheckWorkItem = nil
+        walkthroughClickRequestedCheck = false
+    }
+
+    /// Waits up to one poll interval, but returns early as soon as a click asks
+    /// for an immediate check. Polls a small flag every 120ms so a click during
+    /// the wait shortcuts the remainder.
+    private func waitForPollIntervalOrClick() async {
+        walkthroughClickRequestedCheck = false
+        var elapsedNanoseconds: UInt64 = 0
+        let chunkNanoseconds: UInt64 = 120_000_000
+        while elapsedNanoseconds < Self.walkthroughPollIntervalNanoseconds && !walkthroughClickRequestedCheck {
+            try? await Task.sleep(nanoseconds: chunkNanoseconds)
+            if Task.isCancelled { return }
+            elapsedNanoseconds += chunkNanoseconds
+        }
+    }
+
+    /// Builds a natural-sounding spoken line for a step. The first step gets an
+    /// "okay, first" lead-in; later steps get a short affirmation + connector
+    /// (rotated by index) so it never robotically announces "step three".
+    private static func naturalSpokenLine(forStepIndex stepIndex: Int, instruction: String) -> String {
+        if stepIndex == 0 {
+            return "alright, first — \(instruction)"
+        }
+        let transitions = [
+            "nice. next, \(instruction)",
+            "great. now \(instruction)",
+            "perfect. then \(instruction)",
+            "awesome. after that, \(instruction)"
+        ]
+        return transitions[(stepIndex - 1) % transitions.count]
     }
 
     /// The main walkthrough loop. For each step: locate + point at the element,
@@ -892,7 +963,7 @@ final class CompanionManager: ObservableObject {
 
             // 1) Locate the element on the current screen and fly the cursor to it.
             guidedWalkthroughManager.setPhase(.locating)
-            await pointAtWalkthroughStep(step)
+            let locatedStep = await pointAtWalkthroughStep(step)
             if Task.isCancelled { return }
 
             // Speak the instruction only the first time we enter this step —
@@ -900,18 +971,32 @@ final class CompanionManager: ObservableObject {
             if lastSpokenStepNumber != step.stepNumber {
                 lastSpokenStepNumber = step.stepNumber
                 voiceState = .responding
-                try? await speakWalkthrough("step \(step.stepNumber). \(step.instruction)")
+                try? await speakWalkthrough(Self.naturalSpokenLine(
+                    forStepIndex: guidedWalkthroughManager.currentStepIndex,
+                    instruction: step.instruction
+                ))
                 voiceState = .idle
+
+                // If this step is a scroll action, demonstrate the scroll at the
+                // pointed location after speaking, so the user sees it happen.
+                if let locatedStep, let scrollDirection = locatedStep.scrollDirection {
+                    await ClickyGesturePerformer.performScroll(
+                        atGlobalAppKitPoint: locatedStep.location,
+                        direction: scrollDirection
+                    )
+                }
             }
 
             // 2) Watch the screen until the step is done or polls run out.
+            // The wait wakes early the moment the user clicks, so advancement
+            // feels immediate rather than tied to the poll timer.
             guidedWalkthroughManager.setPhase(.watching)
             var stepCompleted = false
             var pollsForThisStep = 0
             while !stepCompleted
                     && pollsForThisStep < Self.walkthroughMaxPollsBeforeNudge
                     && watchCallsRemaining > 0 {
-                try? await Task.sleep(nanoseconds: Self.walkthroughPollIntervalNanoseconds)
+                await waitForPollIntervalOrClick()
                 if Task.isCancelled { return }
                 pollsForThisStep += 1
                 watchCallsRemaining -= 1
@@ -928,9 +1013,8 @@ final class CompanionManager: ObservableObject {
                         stepIndex: guidedWalkthroughManager.currentStepIndex,
                         stepCount: guidedWalkthroughManager.totalStepCount
                     )
-                    voiceState = .responding
-                    try? await speakWalkthrough("nice. next up.")
-                    voiceState = .idle
+                    // No spoken line here — the next loop iteration speaks a
+                    // natural lead-in that already includes a short affirmation.
                 } else {
                     voiceState = .responding
                     try? await speakWalkthrough("and that's it — nicely done.")
@@ -952,12 +1036,22 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// Where a located step lives on screen, plus an optional scroll the step
+    /// wants Clicky to demonstrate there.
+    private struct LocatedWalkthroughStep {
+        let location: CGPoint
+        let scrollDirection: ClickyScrollDirection?
+    }
+
     /// Locates the current step's element on a fresh screenshot and points the
-    /// cursor at it, showing the step instruction in the speech bubble.
-    private func pointAtWalkthroughStep(_ step: WalkthroughStep) async {
+    /// cursor at it, showing the step instruction in the speech bubble. Returns
+    /// the on-screen location (and any scroll the step calls for) so the caller
+    /// can demonstrate a scroll after speaking the instruction.
+    @discardableResult
+    private func pointAtWalkthroughStep(_ step: WalkthroughStep) async -> LocatedWalkthroughStep? {
         do {
             let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
-            guard let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }) else { return }
+            guard let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }) else { return nil }
 
             let dimensionInfo = " (image dimensions: \(cursorScreenCapture.screenshotWidthInPixels)x\(cursorScreenCapture.screenshotHeightInPixels) pixels)"
             let labeledImages = [(data: cursorScreenCapture.imageData, label: cursorScreenCapture.label + dimensionInfo)]
@@ -972,17 +1066,21 @@ final class CompanionManager: ObservableObject {
                 onTextChunk: { _ in }
             )
 
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else { return nil }
 
             let parseResult = Self.parsePointingCoordinates(from: responseText)
-            guard let pointCoordinate = parseResult.coordinate else { return }
+            guard let pointCoordinate = parseResult.coordinate else { return nil }
 
             let scaled = globalScreenLocation(forPixelCoordinate: pointCoordinate, in: cursorScreenCapture)
             detectedElementBubbleText = "step \(step.stepNumber): \(step.instruction)"
             detectedElementScreenLocation = scaled.location
             detectedElementDisplayFrame = scaled.displayFrame
+
+            let scrollDirection = ClickyGesturePerformer.parseScrollDirection(from: responseText)
+            return LocatedWalkthroughStep(location: scaled.location, scrollDirection: scrollDirection)
         } catch {
             print("⚠️ Walkthrough locate error: \(error)")
+            return nil
         }
     }
 
@@ -1032,6 +1130,7 @@ final class CompanionManager: ObservableObject {
     /// Ends the walkthrough, shows the HUD's done state briefly, then dismisses it.
     private func finishWalkthrough(completed: Bool) {
         guidedWalkthroughManager.finish()
+        stopWalkthroughClickMonitor()
         clearDetectedElementLocation()
         voiceState = .idle
         currentWalkthroughTask = nil
