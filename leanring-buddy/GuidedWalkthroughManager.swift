@@ -29,6 +29,17 @@ struct WalkthroughStep: Equatable, Identifiable {
     /// A 1-3 word label naming the UI element this step concerns. Used when
     /// asking Claude to locate the element on the current screen.
     let targetLabel: String
+    /// True when this step is a choice or optional ("public or private — your
+    /// call"). The user might keep the default, so there's nothing to detect —
+    /// Clicky points, explains, and moves on instead of waiting for a change.
+    let isDecision: Bool
+
+    init(stepNumber: Int, instruction: String, targetLabel: String, isDecision: Bool = false) {
+        self.stepNumber = stepNumber
+        self.instruction = instruction
+        self.targetLabel = targetLabel
+        self.isDecision = isDecision
+    }
 
     var id: Int { stepNumber }
 }
@@ -151,6 +162,7 @@ final class GuidedWalkthroughManager: ObservableObject {
     rules for the block:
     - each line is: step number, close paren, the instruction, a pipe, then a 1-3 word label naming the on-screen element for that step.
     - keep instructions short and spoken-friendly (a sentence at most). the element label is what you'd point at on screen.
+    - if a step is a choice or optional — the user might just keep the default (like "set it to public or private, your call", or "optionally add a description") — add a THIRD field after another pipe: the word choice. example: `3) set it to public or private, your call | visibility toggle | choice`. clicky won't wait on these steps; it points, explains the options, and moves on, so it never gets stuck waiting for a change that may not happen.
     - only emit a walkthrough when there are at least two real steps and they happen on screen. for a single action, just use a normal [POINT:] tag instead. for pure knowledge questions, use neither.
     - your spoken intro before the block should be one short warm sentence like "sure, here's how — i'll walk you through it." do not read the steps aloud; the walkthrough handles that.
     - do not add a [POINT:] tag when you emit a walkthrough.
@@ -263,27 +275,44 @@ final class GuidedWalkthroughManager: ObservableObject {
 
             let body = String(line[bodyRange]).trimmingCharacters(in: .whitespaces)
 
-            // Split instruction and label on the first pipe. If there's no pipe,
-            // reuse the instruction as the label so locating still has something.
-            let instruction: String
-            let label: String
-            if let pipeIndex = body.firstIndex(of: "|") {
-                instruction = String(body[..<pipeIndex]).trimmingCharacters(in: .whitespaces)
-                label = String(body[body.index(after: pipeIndex)...]).trimmingCharacters(in: .whitespaces)
-            } else {
-                instruction = body
-                label = body
-            }
+            // A step line is: instruction | element label | optional kind.
+            // The kind field marks decision/optional steps ("... | choice").
+            // Missing fields fall back: no label → reuse the instruction.
+            let components = body
+                .split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
 
+            let instruction = components[0]
             guard !instruction.isEmpty else { continue }
+
+            let label = (components.count >= 2 && !components[1].isEmpty) ? components[1] : instruction
+            let kindField = components.count >= 3 ? components[2] : ""
+
             steps.append(WalkthroughStep(
                 stepNumber: stepNumber,
                 instruction: instruction,
-                targetLabel: label.isEmpty ? instruction : label
+                targetLabel: label,
+                isDecision: looksLikeDecisionStep(kindField: kindField, instruction: instruction)
             ))
         }
 
         return steps
+    }
+
+    /// Decides whether a step is a choice/optional step (so Clicky shouldn't
+    /// block waiting for a screen change). Triggers on an explicit kind field
+    /// ("... | choice") or clear "your call / optional / depending on" phrasing.
+    static func looksLikeDecisionStep(kindField: String, instruction: String) -> Bool {
+        let lowercasedKind = kindField.lowercased()
+        for keyword in ["choice", "optional", "decision", "decide"] where lowercasedKind.contains(keyword) {
+            return true
+        }
+        let lowercasedInstruction = instruction.lowercased()
+        let decisionPhrases = ["your choice", "your call", "depending on", "if you want", "if you'd like", "optional"]
+        for phrase in decisionPhrases where lowercasedInstruction.contains(phrase) {
+            return true
+        }
+        return false
     }
 
     /// Returns true when a watch response indicates the current step is done.

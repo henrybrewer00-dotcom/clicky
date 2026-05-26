@@ -926,6 +926,21 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// Waits a short window for a decision/optional step, returning early the
+    /// instant the user clicks. This gives them time to make a choice (or keep
+    /// the default) without the walkthrough ever blocking on it.
+    private func waitForDecisionWindowOrClick() async {
+        walkthroughClickRequestedCheck = false
+        let decisionWindowNanoseconds: UInt64 = 4_500_000_000
+        var elapsedNanoseconds: UInt64 = 0
+        let chunkNanoseconds: UInt64 = 120_000_000
+        while elapsedNanoseconds < decisionWindowNanoseconds && !walkthroughClickRequestedCheck {
+            try? await Task.sleep(nanoseconds: chunkNanoseconds)
+            if Task.isCancelled { return }
+            elapsedNanoseconds += chunkNanoseconds
+        }
+    }
+
     /// Builds a natural-sounding spoken line for a step. The first step gets an
     /// "okay, first" lead-in; later steps get a short affirmation + connector
     /// (rotated by index) so it never robotically announces "step three".
@@ -985,6 +1000,31 @@ final class CompanionManager: ObservableObject {
                         direction: scrollDirection
                     )
                 }
+            }
+
+            // Decision/optional steps ("public or private — your call") may have
+            // nothing to detect if the user keeps the default, so we never block
+            // on them. Give a short window to act (advancing instantly on a
+            // click), then move on to the next step.
+            if step.isDecision {
+                guidedWalkthroughManager.setPhase(.watching)
+                await waitForDecisionWindowOrClick()
+                if Task.isCancelled { return }
+                guidedWalkthroughManager.setPhase(.advancing)
+                if guidedWalkthroughManager.advanceToNextStep() {
+                    ClickyAnalytics.trackWalkthroughStepAdvanced(
+                        stepIndex: guidedWalkthroughManager.currentStepIndex,
+                        stepCount: guidedWalkthroughManager.totalStepCount
+                    )
+                } else {
+                    voiceState = .responding
+                    try? await speakWalkthrough("and that's it — nicely done.")
+                    voiceState = .idle
+                    ClickyAnalytics.trackWalkthroughCompleted(stepCount: guidedWalkthroughManager.totalStepCount)
+                    finishWalkthrough(completed: true)
+                    return
+                }
+                continue
             }
 
             // 2) Watch the screen until the step is done or polls run out.
