@@ -3,9 +3,14 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/",
+    "test:live": "CLICKY_RUN_LIVE_TTS=1 node --test test/"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240117.0",
+    "typescript": "^5.4.0",
     "wrangler": "^3.0.0"
   }
 }

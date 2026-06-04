@@ -130,6 +130,10 @@ struct BlueCursorView: View {
     @State private var bubbleOpacity: Double = 1.0
     @State private var cursorOpacity: Double = 0.0
 
+    /// Recent cursor positions used to draw the comet style's fading particle
+    /// trail during flight. Oldest first, newest last; capped to a short length.
+    @State private var trailPositions: [CGPoint] = []
+
     // MARK: - Buddy Navigation State
 
     /// The buddy's current behavioral mode (following cursor, navigating, or pointing).
@@ -195,8 +199,8 @@ struct BlueCursorView: View {
                     .padding(.vertical, 4)
                     .background(
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(DS.Colors.overlayCursorBlue)
-                            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.5), radius: 6, x: 0, y: 0)
+                            .fill(companionManager.cursorPrimaryColor)
+                            .shadow(color: companionManager.cursorGlowColor.opacity(0.5), radius: 6, x: 0, y: 0)
                     )
                     .fixedSize()
                     .overlay(
@@ -239,8 +243,8 @@ struct BlueCursorView: View {
                     .padding(.vertical, 4)
                     .background(
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(DS.Colors.overlayCursorBlue)
-                            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.5), radius: 6, x: 0, y: 0)
+                            .fill(companionManager.cursorPrimaryColor)
+                            .shadow(color: companionManager.cursorGlowColor.opacity(0.5), radius: 6, x: 0, y: 0)
                     )
                     .fixedSize()
                     .overlay(
@@ -269,9 +273,9 @@ struct BlueCursorView: View {
                     .padding(.vertical, 4)
                     .background(
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
-                            .fill(DS.Colors.overlayCursorBlue)
+                            .fill(companionManager.cursorPrimaryColor)
                             .shadow(
-                                color: DS.Colors.overlayCursorBlue.opacity(0.5 + (1.0 - navigationBubbleScale) * 1.0),
+                                color: companionManager.cursorGlowColor.opacity(0.5 + (1.0 - navigationBubbleScale) * 1.0),
                                 radius: 6 + (1.0 - navigationBubbleScale) * 16,
                                 x: 0, y: 0
                             )
@@ -302,11 +306,32 @@ struct BlueCursorView: View {
             // During cursor following: fast spring animation for snappy tracking.
             // During navigation: NO implicit animation — the frame-by-frame bezier
             // timer controls position directly at 60fps for a smooth arc flight.
-            Triangle()
-                .fill(DS.Colors.overlayCursorBlue)
+            // Comet particle trail — fading dots left behind the glyph during
+            // flight. Only rendered for the comet style and only while flying,
+            // where motion is fast and timer-driven (so the trail reads clearly).
+            if companionManager.selectedCursorStyle.hasParticleTrail
+                && buddyNavigationMode != .followingCursor
+                && buddyIsVisibleOnThisScreen {
+                ForEach(trailPositions.indices, id: \.self) { trailIndex in
+                    let trailProgress = CGFloat(trailIndex) / CGFloat(max(trailPositions.count - 1, 1))
+                    Circle()
+                        .fill(companionManager.cursorPrimaryColor.opacity(0.04 + trailProgress * 0.30))
+                        .frame(width: 3 + trailProgress * 7, height: 3 + trailProgress * 7)
+                        .blur(radius: 1.2)
+                        .position(trailPositions[trailIndex])
+                        .opacity(cursorOpacity)
+                        .allowsHitTesting(false)
+                }
+            }
+
+            CursorGlyphView(
+                style: companionManager.selectedCursorStyle,
+                primaryColor: companionManager.cursorPrimaryColor,
+                travelRotationDegrees: triangleRotationDegrees,
+                isNavigating: buddyNavigationMode != .followingCursor
+            )
                 .frame(width: 16, height: 16)
-                .rotationEffect(.degrees(triangleRotationDegrees))
-                .shadow(color: DS.Colors.overlayCursorBlue, radius: 8 + (buddyFlightScale - 1.0) * 20, x: 0, y: 0)
+                .shadow(color: companionManager.cursorGlowColor, radius: 8 + (buddyFlightScale - 1.0) * 20, x: 0, y: 0)
                 .scaleEffect(buddyFlightScale)
                 .opacity(buddyIsVisibleOnThisScreen && (companionManager.voiceState == .idle || companionManager.voiceState == .responding) ? cursorOpacity : 0)
                 .position(cursorPosition)
@@ -323,18 +348,33 @@ struct BlueCursorView: View {
                 )
 
             // Blue waveform — replaces the triangle while listening
-            BlueCursorWaveformView(audioPowerLevel: companionManager.currentAudioPowerLevel)
+            BlueCursorWaveformView(
+                audioPowerLevel: companionManager.currentAudioPowerLevel,
+                color: companionManager.cursorPrimaryColor
+            )
                 .opacity(buddyIsVisibleOnThisScreen && companionManager.voiceState == .listening ? cursorOpacity : 0)
                 .position(cursorPosition)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
 
             // Blue spinner — shown while the AI is processing (transcription + Claude + waiting for TTS)
-            BlueCursorSpinnerView()
+            BlueCursorSpinnerView(color: companionManager.cursorPrimaryColor)
                 .opacity(buddyIsVisibleOnThisScreen && companionManager.voiceState == .processing ? cursorOpacity : 0)
                 .position(cursorPosition)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
+
+            // Clicky Coach progress HUD — pinned to the top-center of the screen
+            // the cursor is on, so only one HUD shows across multiple monitors.
+            if isCursorOnThisScreen {
+                WalkthroughHUDView(
+                    walkthrough: companionManager.guidedWalkthroughManager,
+                    themeColor: companionManager.cursorPrimaryColor,
+                    glowColor: companionManager.cursorGlowColor
+                )
+                .position(x: screenFrame.width / 2, y: 78)
+                .allowsHitTesting(false)
+            }
 
         }
         .frame(width: screenFrame.width, height: screenFrame.height)
@@ -481,6 +521,8 @@ struct BlueCursorView: View {
         // Enter navigation mode — stop cursor following
         buddyNavigationMode = .navigatingToTarget
         isReturningToCursor = false
+        // Start the comet trail fresh so it doesn't streak from a stale position.
+        trailPositions.removeAll()
 
         animateBezierFlightArc(to: clampedTarget) {
             guard self.buddyNavigationMode == .navigatingToTarget else { return }
@@ -549,6 +591,7 @@ struct BlueCursorView: View {
                         + t * t * endPosition.y
 
             self.cursorPosition = CGPoint(x: bezierX, y: bezierY)
+            self.appendTrailPoint(self.cursorPosition)
 
             // Rotation: face the direction of travel by computing the tangent
             // to the bezier curve. B'(t) = 2(1-t)(P1-P0) + 2t(P2-P1)
@@ -669,7 +712,18 @@ struct BlueCursorView: View {
         navigationBubbleText = ""
         navigationBubbleOpacity = 0.0
         navigationBubbleScale = 1.0
+        trailPositions.removeAll()
         companionManager.clearDetectedElementLocation()
+    }
+
+    /// Appends a position to the comet trail history, keeping only the most
+    /// recent points so the trail stays short and the array stays bounded.
+    private func appendTrailPoint(_ point: CGPoint) {
+        trailPositions.append(point)
+        let maximumTrailLength = 12
+        if trailPositions.count > maximumTrailLength {
+            trailPositions.removeFirst(trailPositions.count - maximumTrailLength)
+        }
     }
 
     // MARK: - Welcome Animation
@@ -708,6 +762,8 @@ struct BlueCursorView: View {
 /// the user is holding the push-to-talk shortcut and speaking.
 private struct BlueCursorWaveformView: View {
     let audioPowerLevel: CGFloat
+    /// The themed cursor color so the waveform matches the selected cursor theme.
+    let color: Color
 
     private let barCount = 5
     private let listeningBarProfile: [CGFloat] = [0.4, 0.7, 1.0, 0.7, 0.4]
@@ -717,7 +773,7 @@ private struct BlueCursorWaveformView: View {
             HStack(alignment: .center, spacing: 2) {
                 ForEach(0..<barCount, id: \.self) { barIndex in
                     RoundedRectangle(cornerRadius: 1.5, style: .continuous)
-                        .fill(DS.Colors.overlayCursorBlue)
+                        .fill(color)
                         .frame(
                             width: 2,
                             height: barHeight(
@@ -727,7 +783,7 @@ private struct BlueCursorWaveformView: View {
                         )
                 }
             }
-            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.6), radius: 6, x: 0, y: 0)
+            .shadow(color: color.opacity(0.6), radius: 6, x: 0, y: 0)
             .animation(.linear(duration: 0.08), value: audioPowerLevel)
         }
     }
@@ -742,11 +798,110 @@ private struct BlueCursorWaveformView: View {
     }
 }
 
+// MARK: - Clicky Coach HUD
+
+/// A floating progress card shown at the top of the screen while a guided
+/// walkthrough is running. Displays the current step, an instruction, and a
+/// progress bar, and switches to a celebratory "all done" state at the end.
+/// Non-interactive — it lives in the click-through overlay window.
+private struct WalkthroughHUDView: View {
+    @ObservedObject var walkthrough: GuidedWalkthroughManager
+    let themeColor: Color
+    let glowColor: Color
+
+    var body: some View {
+        Group {
+            if walkthrough.isActive {
+                cardContent
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .animation(.spring(response: 0.4, dampingFraction: 0.8), value: walkthrough.isActive)
+        .animation(.easeInOut(duration: 0.3), value: walkthrough.currentStepIndex)
+        .animation(.easeInOut(duration: 0.3), value: walkthrough.phase)
+    }
+
+    private var isCompleted: Bool { walkthrough.phase == .completed }
+
+    private var cardContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Header — branding + step counter.
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(themeColor)
+                Text("Clicky Coach")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Spacer()
+                Text(isCompleted ? "Done" : "Step \(walkthrough.currentStepIndex + 1) of \(walkthrough.totalStepCount)")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+
+            // Instruction (or completion message).
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: isCompleted ? "checkmark.circle.fill" : phaseSymbol)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(isCompleted ? DS.Colors.success : themeColor)
+                    .padding(.top, 1)
+                Text(isCompleted ? "All done — nicely done!" : (walkthrough.currentStep?.instruction ?? ""))
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // Progress bar.
+            GeometryReader { geometry in
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color.white.opacity(0.08))
+                        .frame(height: 4)
+                    Capsule()
+                        .fill(isCompleted ? DS.Colors.success : themeColor)
+                        .frame(width: max(6, geometry.size.width * CGFloat(walkthrough.progressFraction)), height: 4)
+                        .shadow(color: glowColor.opacity(0.6), radius: 4)
+                        .animation(.easeInOut(duration: 0.4), value: walkthrough.progressFraction)
+                }
+            }
+            .frame(height: 4)
+
+            // Hint footer.
+            Text(isCompleted ? "" : "Following along — hold control + option to ask me anything")
+                .font(.system(size: 10))
+                .foregroundColor(DS.Colors.textTertiary)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .frame(width: 360)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(DS.Colors.surface1.opacity(0.96))
+                .shadow(color: Color.black.opacity(0.45), radius: 18, x: 0, y: 10)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(themeColor.opacity(0.35), lineWidth: 1)
+        )
+    }
+
+    private var phaseSymbol: String {
+        switch walkthrough.phase {
+        case .locating: return "scope"
+        case .watching: return "eye.fill"
+        case .advancing: return "checkmark.circle.fill"
+        case .completed: return "checkmark.circle.fill"
+        }
+    }
+}
+
 // MARK: - Blue Cursor Spinner
 
 /// A small blue spinning indicator that replaces the triangle cursor
 /// while the AI is processing a voice input.
 private struct BlueCursorSpinnerView: View {
+    /// The themed cursor color so the spinner matches the selected cursor theme.
+    let color: Color
     @State private var isSpinning = false
 
     var body: some View {
@@ -755,8 +910,8 @@ private struct BlueCursorSpinnerView: View {
             .stroke(
                 AngularGradient(
                     colors: [
-                        DS.Colors.overlayCursorBlue.opacity(0.0),
-                        DS.Colors.overlayCursorBlue
+                        color.opacity(0.0),
+                        color
                     ],
                     center: .center
                 ),
@@ -764,7 +919,7 @@ private struct BlueCursorSpinnerView: View {
             )
             .frame(width: 14, height: 14)
             .rotationEffect(.degrees(isSpinning ? 360 : 0))
-            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.6), radius: 6, x: 0, y: 0)
+            .shadow(color: color.opacity(0.6), radius: 6, x: 0, y: 0)
             .onAppear {
                 withAnimation(.linear(duration: 0.8).repeatForever(autoreverses: false)) {
                     isSpinning = true
@@ -779,6 +934,12 @@ private struct BlueCursorSpinnerView: View {
 class OverlayWindowManager {
     private var overlayWindows: [OverlayWindow] = []
     var hasShownOverlayBefore = false
+
+    /// Observes Space changes so the overlay re-asserts itself when another app
+    /// (FaceTime, Keynote, a fullscreen browser, etc.) enters fullscreen and
+    /// macOS moves it to its own Space. Without re-ordering front on that
+    /// transition, the cursor and Coach HUD can drop out of the new Space.
+    private var activeSpaceChangeObserver: NSObjectProtocol?
 
     func showOverlay(onScreens screens: [NSScreen], companionManager: CompanionManager) {
         // Hide any existing overlays
@@ -805,9 +966,42 @@ class OverlayWindowManager {
             overlayWindows.append(window)
             window.orderFrontRegardless()
         }
+
+        startObservingActiveSpaceChanges()
+    }
+
+    /// Re-orders every overlay window to the front. Called on Space changes so
+    /// the overlay reliably appears over fullscreen apps in their own Spaces.
+    func reassertOverlayInFront() {
+        for window in overlayWindows {
+            window.orderFrontRegardless()
+        }
+    }
+
+    private func startObservingActiveSpaceChanges() {
+        guard activeSpaceChangeObserver == nil else { return }
+        activeSpaceChangeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            // The notification is delivered on the main queue, so hop to the
+            // main actor to touch the windows.
+            Task { @MainActor [weak self] in
+                self?.reassertOverlayInFront()
+            }
+        }
+    }
+
+    private func stopObservingActiveSpaceChanges() {
+        if let observer = activeSpaceChangeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            activeSpaceChangeObserver = nil
+        }
     }
 
     func hideOverlay() {
+        stopObservingActiveSpaceChanges()
         for window in overlayWindows {
             window.orderOut(nil)
             window.contentView = nil
@@ -817,6 +1011,7 @@ class OverlayWindowManager {
 
     /// Fades out overlay windows over `duration` seconds, then removes them.
     func fadeOutAndHideOverlay(duration: TimeInterval = 0.4) {
+        stopObservingActiveSpaceChanges()
         let windowsToFade = overlayWindows
         overlayWindows.removeAll()
 

@@ -20,6 +20,8 @@ All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in th
 - **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support
 - **Voice Input**: Push-to-talk via `AVAudioEngine` + pluggable transcription-provider layer. System-wide keyboard shortcut via listen-only CGEvent tap.
 - **Element Pointing**: Claude embeds `[POINT:x,y:label:screenN]` tags in responses. The overlay parses these, maps coordinates to the correct monitor, and animates the blue cursor along a bezier arc to the target.
+- **Guided Walkthroughs ("Clicky Coach")**: For multi-step tasks, Claude returns a `[WALKTHROUGH: title] … [/WALKTHROUGH]` plan. `GuidedWalkthroughManager` parses it; `CompanionManager` then points at each step, watches the screen via periodic screenshots, and auto-advances when a step is detected complete. A non-interactive HUD shows progress.
+- **Cursor Styles & Themes**: The follower cursor has selectable styles (classic triangle, comet w/ particle trail, rocket, sparkle) and color themes, defined in `CursorStyle.swift` and persisted to UserDefaults. The default is the classic blue triangle (unchanged look).
 - **Concurrency**: `@MainActor` isolation, async/await throughout
 - **Analytics**: PostHog via `ClickyAnalytics.swift`
 
@@ -27,14 +29,21 @@ All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in th
 
 The app never calls external APIs directly. All requests go through a Cloudflare Worker (`worker/src/index.ts`) that holds the real API keys as secrets.
 
-| Route | Upstream | Purpose |
-|-------|----------|---------|
-| `POST /chat` | `api.anthropic.com/v1/messages` | Claude vision + streaming chat |
-| `POST /tts` | `api.elevenlabs.io/v1/text-to-speech/{voiceId}` | ElevenLabs TTS audio |
-| `POST /transcribe-token` | `streaming.assemblyai.com/v3/token` | Fetches a short-lived (480s) AssemblyAI websocket token |
+| Route | Method | Upstream | Purpose |
+|-------|--------|----------|---------|
+| `/health` | GET | — | Liveness probe; reports which upstream keys are configured (never the values) |
+| `/chat` | POST | `api.anthropic.com/v1/messages` | Claude vision + streaming chat (validates a non-empty `messages` array first) |
+| `/tts` | POST | `api.elevenlabs.io/v1/text-to-speech/{voiceId}` | ElevenLabs TTS audio (buffered). Accepts `text`, optional `voice_id`, `model_id`, `voice_settings` |
+| `/tts/stream` | POST | `…/text-to-speech/{voiceId}/stream` | Streamed TTS for lower time-to-first-sound |
+| `/voices` | GET | `api.elevenlabs.io/v1/voices` | Simplified voice list (id, name, category) for a voice picker |
+| `/transcribe-token` | POST | `streaming.assemblyai.com/v3/token` | Fetches a short-lived (480s) AssemblyAI websocket token |
+
+All routes return permissive CORS headers, handle `OPTIONS` preflight, enforce a 16 MB body limit, and return a consistent `{ "error": { message, status } }` envelope on failure. Routes whose key is unconfigured return 503.
 
 Worker secrets: `ANTHROPIC_API_KEY`, `ASSEMBLYAI_API_KEY`, `ELEVENLABS_API_KEY`
 Worker vars: `ELEVENLABS_VOICE_ID`
+
+The Worker has an automated test suite (`worker/test/worker.test.mjs`, run via `npm test`) that boots `wrangler dev` and exercises every route over HTTP, plus an opt-in live ElevenLabs TTS check (`npm run test:live`).
 
 ### Key Architecture Decisions
 
@@ -53,10 +62,12 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | File | Lines | Purpose |
 |------|-------|---------|
 | `leanring_buddyApp.swift` | ~89 | Menu bar app entry point. Uses `@NSApplicationDelegateAdaptor` with `CompanionAppDelegate` which creates `MenuBarPanelManager` and starts `CompanionManager`. No main window — the app lives entirely in the status bar. |
-| `CompanionManager.swift` | ~1026 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, ElevenLabs TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → screenshot → Claude → TTS → pointing pipeline. |
+| `CompanionManager.swift` | ~1300 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, ElevenLabs TTS, overlay management, cursor style/theme selection, and the Clicky Coach walkthrough orchestration. Tracks voice state, conversation history, model selection, and cursor visibility. Coordinates push-to-talk → screenshot → Claude → TTS → pointing/walkthrough. |
 | `MenuBarPanelManager.swift` | ~243 | NSStatusItem + custom NSPanel lifecycle. Creates the menu bar icon, manages the floating companion panel (show/hide/position), installs click-outside-to-dismiss monitor. |
 | `CompanionPanelView.swift` | ~761 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, model picker (Sonnet/Opus), permissions UI, DM feedback button, and quit button. Dark aesthetic using `DS` design system. |
-| `OverlayWindow.swift` | ~881 | Full-screen transparent overlay hosting the blue cursor, response text, waveform, and spinner. Handles cursor animation, element pointing with bezier arcs, multi-monitor coordinate mapping, and fade-out transitions. |
+| `OverlayWindow.swift` | ~1010 | Full-screen transparent overlay hosting the cursor glyph, response text, waveform, spinner, comet trail, and the Clicky Coach progress HUD. Handles cursor animation, element pointing with bezier arcs, multi-monitor coordinate mapping, and fade-out transitions. Renders the selected `CursorGlyphView`. |
+| `CursorStyle.swift` | ~210 | Cursor appearance model: `ClickyCursorStyle` (classic/comet/rocket/sparkle), `ClickyCursorTheme` (color themes), and the `CursorGlyphView` that renders the selected glyph. Pure data + persistence helpers. |
+| `GuidedWalkthroughManager.swift` | ~290 | "Clicky Coach" — guided walkthrough plan model, observable progress state, the walkthrough prompts, and the pure (unit-tested) parsers that turn Claude's `[WALKTHROUGH]`/`[STATUS]` tags into structured data. |
 | `CompanionResponseOverlay.swift` | ~217 | SwiftUI view for the response text bubble and waveform displayed next to the cursor in the overlay. |
 | `CompanionScreenCaptureUtility.swift` | ~132 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. |
 | `BuddyDictationManager.swift` | ~866 | Push-to-talk voice pipeline. Handles microphone capture via `AVAudioEngine`, provider-aware permission checks, keyboard/button dictation sessions, transcript finalization, shortcut parsing, contextual keyterms, and live audio-level reporting for waveform feedback. |
@@ -73,8 +84,10 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | `DesignSystem.swift` | ~880 | Design system tokens — colors, corner radii, shared styles. All UI references `DS.Colors`, `DS.CornerRadius`, etc. |
 | `ClickyAnalytics.swift` | ~121 | PostHog analytics integration for usage tracking. |
 | `WindowPositionManager.swift` | ~262 | Window placement logic, Screen Recording permission flow, and accessibility permission helpers. |
-| `AppBundleConfiguration.swift` | ~28 | Runtime configuration reader for keys stored in the app bundle Info.plist. |
-| `worker/src/index.ts` | ~142 | Cloudflare Worker proxy. Three routes: `/chat` (Claude), `/tts` (ElevenLabs), `/transcribe-token` (AssemblyAI temp token). |
+| `AppBundleConfiguration.swift` | ~45 | Runtime configuration reader for Info.plist keys. Exposes `proxyBaseURL` (from `ClickyProxyBaseURL`) as the single source of truth for the Worker URL. |
+| `ClickyAnalytics.swift` | ~180 | PostHog analytics. Includes cursor-appearance and Clicky Coach walkthrough events. |
+| `worker/src/index.ts` | ~360 | Cloudflare Worker proxy. Routes: `/health`, `/chat`, `/tts`, `/tts/stream`, `/voices`, `/transcribe-token`. CORS, input validation, body-size limits, consistent error envelope. |
+| `worker/test/worker.test.mjs` | ~210 | Integration test suite — boots `wrangler dev` and exercises every route over HTTP, plus an opt-in live ElevenLabs TTS check. |
 
 ## Build & Run
 
@@ -106,7 +119,17 @@ npx wrangler deploy
 
 # Local dev (create worker/.dev.vars with your keys)
 npx wrangler dev
+
+# Type-check and run the test suite
+npm run typecheck
+npm test          # boots wrangler dev, exercises every route
+npm run test:live # also runs one real ElevenLabs TTS call (spends credits)
 ```
+
+After deploying, point the app at your Worker by setting `ClickyProxyBaseURL` in
+`leanring-buddy/Info.plist` to your `https://<name>.<subdomain>.workers.dev` URL.
+This is the single config point — `AppBundleConfiguration.proxyBaseURL` reads it
+and both `CompanionManager` and the AssemblyAI provider use it.
 
 ## Code Style & Conventions
 
